@@ -13,13 +13,13 @@ __all__ = ['AbstractMibInstrumController', 'MibInstrumController']
 
 
 class AbstractMibInstrumController(object):
-    def readVars(self, varBinds, acInfo=(None, None)):
+    def readVars(self, *varBinds, **context):
         raise error.NoSuchInstanceError(idx=0)
 
-    def readNextVars(self, varBinds, acInfo=(None, None)):
+    def readNextVars(self, *varBinds, **context):
         raise error.EndOfMibViewError(idx=0)
 
-    def writeVars(self, varBinds, acInfo=(None, None)):
+    def writeVars(self, *varBinds, **context):
         raise error.NoSuchObjectError(idx=0)
 
 
@@ -183,19 +183,112 @@ class MibInstrumController(AbstractMibInstrumController):
 
     # MIB instrumentation
 
-    def flipFlopFsm(self, fsmTable, inputVarBinds, acInfo):
-        self.__indexMib()
-        debug.logger & debug.flagIns and debug.logger('flipFlopFsm: input var-binds %r' % (inputVarBinds,))
+    @staticmethod
+    def _collectVarBindsCb(varBind, cbCtx, **context):
+        cbFun, (cbCtx, idx, varBindsLen, collectedVarBinds) = cbCtx
+
+        if len(collectedVarBinds) < varBindsLen:
+            collectedVarBinds[idx] = varBind
+            return
+
+        varBinds = [vb[1] for vb in sorted(collectedVarBinds.items(), key=lambda x: x[0])]
+
+        cbFun(varBinds, cbCtx, **context)
+
+    @staticmethod
+    def _flipFlopFsmCb(varBinds, cbCtx, **context):
+        cbFun, (cbCtx, state) = cbCtx
+
+        if any([varBind for varBind in varBinds if isinstance(varBind[1], Exception)]):
+            status = 'err'
+            
+        debug.logger & debug.flagIns and debug.logger(
+            '_flipFlopFsmCb: current state %s, status %s' % (state, status))
+
+        try:
+            newState = fsmTable[(state, status)]
+
+        except KeyError:
+            try:
+                newState = fsmTable[('*', status)]
+
+            except KeyError:
+                raise error.SmiError(
+                    'Unresolved FSM state %s, %s' % (state, status)
+                )
+
+            debug.logger & debug.flagIns and debug.logger(
+                '_flipFlopFsmCb: state %s status %s -> new state %s' % (state, status, newState))
+
+        state = newState
+        status = 'ok'
+
+        if state == 'stop':
+            cbFun(varBinds, cbCtx, **context)
+            return
+
+        mgmtFun = getattr(mibTree, state, None)
+        if not mgmtFun:
+            raise error.SmiError(
+                'Unsupported state handler %s at %s' % (state, self)
+            )
+
+        collectedVarBinds = {}
+
+        for idx, (name, val) in enumerate(varBinds):
+            _cbCtx = self._flipFlopFsmCb, (cbCtx, idx, len(varBinds), collectedVarBinds)
+
+            varBind = (tuple(name), val)
+
+            try:
+                mgmtFun(varBind, self._collectVarBindsCb, _cbCtx, **context)
+
+            except error.SmiError:
+                exc = sys.exc_info()
+                debug.logger & debug.flagIns and debug.logger(
+                    '_flipFlopFsmCb: fun %s exception %s for %r with traceback: %s' % (
+                        mgmtFun, exc[0], varBind, traceback.format_exception(*exc)))
+
+                varBind = name, exc
+
+                self._collectVarBindsCb(varBind, _cbCtx, **context)
+
+            else:
+                debug.logger & debug.flagIns and debug.logger(
+                    '_flipFlopFsmCb: func %s succeeded for %r' % (mgmtFun, varBind))
+
+
+
+
+    def flipFlopFsm(self, fsmTable, varBinds, cbFun=None, cbCtx=None, **context):
+
+        try:
+            fsmContext = context['fsmState']
+
+        except KeyError:
+            self.__indexMib()
+
+            fsmContext = context['fsmState'] = dict(varBinds=[], state='start', status='ok')
+
+            debug.logger & debug.flagIns and debug.logger('flipFlopFsm: input var-binds %r' % (varBinds,))
+
         mibTree, = self.mibBuilder.importSymbols('SNMPv2-SMI', 'iso')
-        outputVarBinds = []
-        state, status = 'start', 'ok'
-        origExc = None
+
+        outputVarBinds = fsmContext['varBinds']
+        state = fsmContext['state']
+        status = fsmContext['status']
+
+
+
+
+
+        origExc = origTraceback = None
         while True:
-            k = (state, status)
+            k = state, status
             if k in fsmTable:
                 fsmState = fsmTable[k]
             else:
-                k = ('*', status)
+                k = '*', status
                 if k in fsmTable:
                     fsmState = fsmTable[k]
                 else:
@@ -208,32 +301,36 @@ class MibInstrumController(AbstractMibInstrumController):
             status = 'ok'
             if state == 'stop':
                 break
-            idx = 0
-            for name, val in inputVarBinds:
-                f = getattr(mibTree, state, None)
-                if f is None:
+
+            for idx, (name, val) in enumerate(varBinds):
+                mgmtFun = getattr(mibTree, state, None)
+                if not mgmtFun:
                     raise error.SmiError(
                         'Unsupported state handler %s at %s' % (state, self)
                     )
+
+                context['idx'] = idx
+
                 try:
                     # Convert to tuple to avoid ObjectName instantiation
                     # on subscription
-                    rval = f(tuple(name), val, idx, acInfo)
+                    rval = mgmtFun((tuple(name), val), **context)
+
                 except error.SmiError:
                     exc_t, exc_v, exc_tb = sys.exc_info()
                     debug.logger & debug.flagIns and debug.logger(
                         'flipFlopFsm: fun %s exception %s for %s=%r with traceback: %s' % (
-                            f, exc_t, name, val, traceback.format_exception(exc_t, exc_v, exc_tb)))
+                            mgmtFun, exc_t, name, val, traceback.format_exception(exc_t, exc_v, exc_tb)))
                     if origExc is None:  # Take the first exception
                         origExc, origTraceback = exc_v, exc_tb
                     status = 'err'
                     break
                 else:
                     debug.logger & debug.flagIns and debug.logger(
-                        'flipFlopFsm: fun %s suceeded for %s=%r' % (f, name, val))
+                        'flipFlopFsm: fun %s suceeded for %s=%r' % (mgmtFun, name, val))
                     if rval is not None:
                         outputVarBinds.append((rval[0], rval[1]))
-                idx += 1
+
         if origExc:
             if sys.version_info[0] <= 2:
                 raise origExc
@@ -244,13 +341,14 @@ class MibInstrumController(AbstractMibInstrumController):
                     # Break cycle between locals and traceback object
                     # (seems to be irrelevant on Py3 but just in case)
                     del origTraceback
+
         return outputVarBinds
 
-    def readVars(self, varBinds, acInfo=(None, None)):
-        return self.flipFlopFsm(self.fsmReadVar, varBinds, acInfo)
+    def readVars(self, *varBinds, **context):
+        return self.flipFlopFsm(self.fsmReadVar, *varBinds, **context)
 
-    def readNextVars(self, varBinds, acInfo=(None, None)):
-        return self.flipFlopFsm(self.fsmReadNextVar, varBinds, acInfo)
+    def readNextVars(self, *varBinds, **context):
+        return self.flipFlopFsm(self.fsmReadNextVar, *varBinds, **context)
 
-    def writeVars(self, varBinds, acInfo=(None, None)):
-        return self.flipFlopFsm(self.fsmWriteVar, varBinds, acInfo)
+    def writeVars(self, *varBinds, **context):
+        return self.flipFlopFsm(self.fsmWriteVar, *varBinds, **context)
